@@ -8,13 +8,15 @@
  * 1. Matrix trace computation with parallel reduction
  * 2. Flash Attention with causal masking and GQA support
  * 
+ * Supported platforms: NVIDIA, Iluvatar (天数)
+ * 
  * Optimization techniques used:
  * - Warp shuffle for fast intra-warp reduction
  * - Grid-stride loops for handling large inputs
  * - Shared memory tiling with bank conflict avoidance
  * - Memory coalescing and vectorized loads
  * - Online softmax for single-pass attention
- * - __ldg() for cached global memory reads
+ * - __ldg() for cached global memory reads (NVIDIA only)
  * - Loop unrolling for reduced instruction overhead
  */
 
@@ -24,6 +26,17 @@
 #include <algorithm>
 
 #include "../tester/utils.h"
+
+// ============================================================================
+// PLATFORM COMPATIBILITY MACROS
+// ============================================================================
+
+// Iluvatar may not support __ldg(), provide fallback
+#if defined(PLATFORM_ILUVATAR)
+    #define LDG(ptr) (*(ptr))
+#else
+    #define LDG(ptr) __ldg(ptr)
+#endif
 
 // ============================================================================
 // CONSTANTS AND CONFIGURATION
@@ -228,7 +241,7 @@ __global__ void flashAttentionKernelOpt(
     for (int i = 0; i < 8; i++) {
         int d = tid + i * blockDim.x;
         if (d < headDim) {
-            qReg[i] = TypeConverter<T>::toFloat(__ldg(&Q[qBase + d]));
+            qReg[i] = TypeConverter<T>::toFloat(LDG(&Q[qBase + d]));
         }
     }
     
@@ -250,8 +263,8 @@ __global__ void flashAttentionKernelOpt(
             int s = idx / headDim;
             int d = idx % headDim;
             size_t kvIdx = kvBase + (size_t)(tileStart + s) * kvHeads * headDim + d;
-            sK[s * headDim + d] = TypeConverter<T>::toFloat(__ldg(&K[kvIdx]));
-            sV[s * headDim + d] = TypeConverter<T>::toFloat(__ldg(&V[kvIdx]));
+            sK[s * headDim + d] = TypeConverter<T>::toFloat(LDG(&K[kvIdx]));
+            sV[s * headDim + d] = TypeConverter<T>::toFloat(LDG(&V[kvIdx]));
         }
         __syncthreads();
         
