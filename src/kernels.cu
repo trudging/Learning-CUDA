@@ -392,7 +392,8 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
     
     // Use optimized kernel for head_dim divisible by warp size
-    const bool useOptimized = (head_dim <= 256) && (head_dim % WARP_SIZE == 0);
+    // Temporarily disabled to debug float test failures
+    const bool useOptimized = false; // (head_dim <= 256) && (head_dim % WARP_SIZE == 0);
     
     if (useOptimized) {
         const int blockSize = WARP_SIZE;  // Single warp per block for correctness
