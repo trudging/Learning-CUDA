@@ -155,7 +155,7 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 }
 
 // ============================================================================
-// FLASH ATTENTION IMPLEMENTATION - HIGHLY OPTIMIZED
+// FLASH ATTENTION IMPLEMENTATION - OPTIMIZED
 // ============================================================================
 
 /**
@@ -180,17 +180,16 @@ struct TypeConverter<half> {
 };
 
 /**
- * @brief Highly optimized Flash Attention kernel
+ * @brief Optimized Flash Attention kernel with online softmax
  * 
- * Optimization features:
- * - Online softmax (single pass)
- * - Large tiles for maximum data reuse
- * - Warp-cooperative QK computation
- * - Efficient shared memory access patterns
+ * Features:
+ * - Online softmax for single-pass computation
+ * - Shared memory tiling for K/V
+ * - Warp shuffle for efficient reduction
  * - __ldg() for cached global memory reads
  */
-template <typename T, int TILE_K = ATTN_TILE_SIZE>
-__global__ void flashAttentionKernelV2(
+template <typename T>
+__global__ void flashAttentionKernelOpt(
     const T* __restrict__ Q,
     const T* __restrict__ K,
     const T* __restrict__ V,
@@ -204,123 +203,107 @@ __global__ void flashAttentionKernelV2(
     const bool isCausal,
     const float scale) {
     
-    // Shared memory layout
+    // Shared memory for K and V tiles
     extern __shared__ float sharedMem[];
-    float* sK = sharedMem;                           // [TILE_K][headDim]
-    float* sV = sK + TILE_K * headDim;               // [TILE_K][headDim]
+    float* sK = sharedMem;
+    float* sV = sK + ATTN_TILE_SIZE * headDim;
     
     const int batchIdx = blockIdx.z;
     const int headIdx = blockIdx.y;
     const int tgtPos = blockIdx.x;
     const int tid = threadIdx.x;
-    const int warpId = tid / WARP_SIZE;
-    const int laneId = tid % WARP_SIZE;
     
     if (batchIdx >= batchSize || headIdx >= queryHeads || tgtPos >= tgtSeqLen) return;
     
     // GQA mapping
     const int kvHeadIdx = headIdx / (queryHeads / kvHeads);
-    const int headsPerKV = queryHeads / kvHeads;
     
-    // Pointer calculations
+    // Base offsets
     const size_t qBase = ((size_t)batchIdx * tgtSeqLen + tgtPos) * queryHeads * headDim + headIdx * headDim;
     const size_t kvBase = (size_t)batchIdx * srcSeqLen * kvHeads * headDim + kvHeadIdx * headDim;
     
-    // Load Q into registers - each thread handles a portion of headDim
-    float qLocal[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // Load Q into registers
+    float qReg[8] = {0.0f};
     #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        int d = tid + i * ATTN_BLOCK_SIZE;
+    for (int i = 0; i < 8; i++) {
+        int d = tid + i * blockDim.x;
         if (d < headDim) {
-            qLocal[i] = TypeConverter<T>::toFloat(__ldg(&Q[qBase + d]));
+            qReg[i] = TypeConverter<T>::toFloat(__ldg(&Q[qBase + d]));
         }
     }
     
     // Online softmax state
     float rowMax = -INFINITY;
     float rowSum = 0.0f;
-    float outLocal[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float outReg[8] = {0.0f};
     
-    // Effective source length (causal masking)
-    const int effectiveLen = isCausal ? min(tgtPos + 1, srcSeqLen) : srcSeqLen;
+    // Effective length with causal masking
+    const int maxSrc = isCausal ? min(tgtPos + 1, srcSeqLen) : srcSeqLen;
     
-    // Process source sequence in tiles
-    for (int tileStart = 0; tileStart < effectiveLen; tileStart += TILE_K) {
-        const int tileEnd = min(tileStart + TILE_K, effectiveLen);
+    // Process in tiles
+    for (int tileStart = 0; tileStart < maxSrc; tileStart += ATTN_TILE_SIZE) {
+        const int tileEnd = min(tileStart + ATTN_TILE_SIZE, maxSrc);
         const int tileLen = tileEnd - tileStart;
         
-        // Cooperative loading of K and V tiles
-        for (int idx = tid; idx < tileLen * headDim; idx += ATTN_BLOCK_SIZE) {
-            int srcLocal = idx / headDim;
+        // Load K and V tiles cooperatively
+        for (int idx = tid; idx < tileLen * headDim; idx += blockDim.x) {
+            int s = idx / headDim;
             int d = idx % headDim;
-            int srcGlobal = tileStart + srcLocal;
-            size_t kvIdx = kvBase + (size_t)srcGlobal * kvHeads * headDim + d;
-            sK[srcLocal * headDim + d] = TypeConverter<T>::toFloat(__ldg(&K[kvIdx]));
-            sV[srcLocal * headDim + d] = TypeConverter<T>::toFloat(__ldg(&V[kvIdx]));
+            size_t kvIdx = kvBase + (size_t)(tileStart + s) * kvHeads * headDim + d;
+            sK[s * headDim + d] = TypeConverter<T>::toFloat(__ldg(&K[kvIdx]));
+            sV[s * headDim + d] = TypeConverter<T>::toFloat(__ldg(&V[kvIdx]));
         }
         __syncthreads();
         
-        // Compute attention for each K position in tile
-        for (int srcLocal = 0; srcLocal < tileLen; srcLocal++) {
-            // Compute dot product Q · K
+        // Process each K position
+        for (int s = 0; s < tileLen; s++) {
+            // Compute dot product
             float dot = 0.0f;
             #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                int d = tid + i * ATTN_BLOCK_SIZE;
+            for (int i = 0; i < 8; i++) {
+                int d = tid + i * blockDim.x;
                 if (d < headDim) {
-                    dot += qLocal[i] * sK[srcLocal * headDim + d];
+                    dot += qReg[i] * sK[s * headDim + d];
                 }
             }
             
             // Warp reduction
             #pragma unroll
-            for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
                 dot += __shfl_down_sync(0xffffffff, dot, offset);
             }
+            // Broadcast to all threads in warp
+            dot = __shfl_sync(0xffffffff, dot, 0);
+            dot *= scale;
             
-            // Cross-warp reduction if needed
-            __shared__ float warpDots[8];
-            if (laneId == 0 && warpId < 8) warpDots[warpId] = dot;
-            __syncthreads();
-            
-            if (tid == 0) {
-                float sum = 0.0f;
-                int numWarps = (ATTN_BLOCK_SIZE + WARP_SIZE - 1) / WARP_SIZE;
-                for (int w = 0; w < numWarps; w++) sum += warpDots[w];
-                warpDots[0] = sum * scale;
-            }
-            __syncthreads();
-            
-            float attnScore = warpDots[0];
-            
-            // Online softmax update
+            // Online softmax
             float prevMax = rowMax;
-            rowMax = fmaxf(rowMax, attnScore);
+            rowMax = fmaxf(rowMax, dot);
             float correction = expf(prevMax - rowMax);
-            rowSum = rowSum * correction + expf(attnScore - rowMax);
+            rowSum = rowSum * correction + expf(dot - rowMax);
             
-            // Update output accumulator
-            float weight = expf(attnScore - rowMax);
+            // Update output
+            float weight = expf(dot - rowMax);
             #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                int d = tid + i * ATTN_BLOCK_SIZE;
+            for (int i = 0; i < 8; i++) {
+                int d = tid + i * blockDim.x;
                 if (d < headDim) {
-                    outLocal[i] = outLocal[i] * correction + weight * sV[srcLocal * headDim + d];
+                    outReg[i] = outReg[i] * correction + weight * sV[s * headDim + d];
                 }
             }
         }
         __syncthreads();
     }
     
-    // Write output with normalization
+    // Write output
     float invSum = (rowSum > 0.0f) ? (1.0f / rowSum) : 0.0f;
     size_t oBase = ((size_t)batchIdx * tgtSeqLen + tgtPos) * queryHeads * headDim + headIdx * headDim;
     
     #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        int d = tid + i * ATTN_BLOCK_SIZE;
+    for (int i = 0; i < 8; i++) {
+        int d = tid + i * blockDim.x;
         if (d < headDim) {
-            O[oBase + d] = TypeConverter<T>::fromFloat(outLocal[i] * invSum);
+            O[oBase + d] = TypeConverter<T>::fromFloat(outReg[i] * invSum);
         }
     }
 }
@@ -355,19 +338,11 @@ __global__ void flashAttentionFallback(
     const int kvH = h / (queryHeads / kvHeads);
     const int maxSrc = isCausal ? min(t + 1, srcSeqLen) : srcSeqLen;
     
-    // Two-pass softmax
+    // Online softmax approach
     float maxVal = -INFINITY;
-    for (int s = 0; s < maxSrc; s++) {
-        float dot = 0.0f;
-        for (int dd = 0; dd < headDim; dd++) {
-            int qIdx = ((b * tgtSeqLen + t) * queryHeads + h) * headDim + dd;
-            int kIdx = ((b * srcSeqLen + s) * kvHeads + kvH) * headDim + dd;
-            dot += TypeConverter<T>::toFloat(Q[qIdx]) * TypeConverter<T>::toFloat(K[kIdx]);
-        }
-        maxVal = fmaxf(maxVal, dot * scale);
-    }
+    float sumExp = 0.0f;
+    float result = 0.0f;
     
-    float sumExp = 0.0f, result = 0.0f;
     for (int s = 0; s < maxSrc; s++) {
         float dot = 0.0f;
         for (int dd = 0; dd < headDim; dd++) {
@@ -375,10 +350,15 @@ __global__ void flashAttentionFallback(
             int kIdx = ((b * srcSeqLen + s) * kvHeads + kvH) * headDim + dd;
             dot += TypeConverter<T>::toFloat(Q[qIdx]) * TypeConverter<T>::toFloat(K[kIdx]);
         }
-        float expVal = expf(dot * scale - maxVal);
-        sumExp += expVal;
+        dot *= scale;
+        
+        float prevMax = maxVal;
+        maxVal = fmaxf(maxVal, dot);
+        float correction = expf(prevMax - maxVal);
+        sumExp = sumExp * correction + expf(dot - maxVal);
+        
         int vIdx = ((b * srcSeqLen + s) * kvHeads + kvH) * headDim + d;
-        result += expVal * TypeConverter<T>::toFloat(V[vIdx]);
+        result = result * correction + expf(dot - maxVal) * TypeConverter<T>::toFloat(V[vIdx]);
     }
     
     int oIdx = ((b * tgtSeqLen + t) * queryHeads + h) * headDim + d;
@@ -387,15 +367,6 @@ __global__ void flashAttentionFallback(
 
 /**
  * @brief Computes Flash Attention for given query, key, and value tensors
- * 
- * Implements scaled dot-product attention with support for:
- * - Causal masking (for autoregressive models)
- * - Grouped Query Attention (GQA) where query_heads > kv_heads
- * 
- * The attention computation follows:
- *   Attention(Q, K, V) = softmax(Q @ K^T / sqrt(head_dim)) @ V
- * 
- * @tparam T Data type (float or half)
  */
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
@@ -420,17 +391,17 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     
     const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
     
-    // Use optimized kernel for standard configurations
-    const bool useOptimized = (head_dim <= 512) && (head_dim >= 32);
+    // Use optimized kernel for head_dim divisible by warp size
+    const bool useOptimized = (head_dim <= 256) && (head_dim % WARP_SIZE == 0);
     
     if (useOptimized) {
-        // Calculate shared memory size
-        const size_t sharedBytes = 2 * ATTN_TILE_SIZE * head_dim * sizeof(float) + 8 * sizeof(float);
+        const int blockSize = WARP_SIZE;  // Single warp per block for correctness
+        const size_t sharedBytes = 2 * ATTN_TILE_SIZE * head_dim * sizeof(float);
         
         dim3 grid(target_seq_len, query_heads, batch_size);
-        dim3 block(ATTN_BLOCK_SIZE);
+        dim3 block(blockSize);
         
-        flashAttentionKernelV2<T, ATTN_TILE_SIZE><<<grid, block, sharedBytes>>>(
+        flashAttentionKernelOpt<T><<<grid, block, sharedBytes>>>(
             d_q, d_k, d_v, d_o,
             batch_size, target_seq_len, src_seq_len,
             query_heads, kv_heads, head_dim,
