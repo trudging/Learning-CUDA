@@ -1,3 +1,20 @@
+/**
+ * @file kernels.cu
+ * @brief CUDA kernel implementations for matrix trace and Flash Attention
+ * @author Training Camp Student
+ * @date 2026-02
+ * 
+ * This file contains optimized CUDA implementations of:
+ * 1. Matrix trace computation with parallel reduction
+ * 2. Flash Attention with causal masking and GQA support
+ * 
+ * Optimization techniques used:
+ * - Warp shuffle for fast intra-warp reduction
+ * - Shared memory tiling for data reuse
+ * - Memory coalescing for efficient global memory access
+ * - Loop unrolling for reduced instruction overhead
+ */
+
 #include <vector>
 #include <cuda_fp16.h>
 #include <cmath>
@@ -5,265 +22,491 @@
 
 #include "../tester/utils.h"
 
-// ===================== TRACE KERNEL =====================
-template <typename T>
-__global__ void traceKernel(const T* input, T* output, size_t rows, size_t cols) {
-  extern __shared__ char shared_mem[];
-  T* sdata = reinterpret_cast<T*>(shared_mem);
-  
-  unsigned int tid = threadIdx.x;
-  unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-  size_t diag_len = min(rows, cols);
-  
-  // Each thread loads one diagonal element
-  T val = T(0);
-  if (i < diag_len) {
-    val = input[i * cols + i];  // diagonal element at (i, i)
-  }
-  sdata[tid] = val;
-  __syncthreads();
-  
-  // Parallel reduction in shared memory
-  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (tid < s) {
-      sdata[tid] = sdata[tid] + sdata[tid + s];
-    }
-    __syncthreads();
-  }
-  
-  // Write result for this block
-  if (tid == 0) {
-    atomicAdd(output, sdata[0]);
-  }
-}
+// ============================================================================
+// CONSTANTS AND CONFIGURATION
+// ============================================================================
 
-// Specialization for int atomicAdd (not natively supported on older GPUs)
-__device__ inline void atomicAddInt(int* address, int val) {
-  atomicAdd(address, val);
+constexpr int WARP_SIZE = 32;
+constexpr int TRACE_BLOCK_SIZE = 256;
+constexpr int TILE_SIZE = 32;
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+/**
+ * @brief Warp-level reduction using shuffle instructions
+ * @tparam T Data type (must support __shfl_down_sync)
+ * @param val Value to reduce within warp
+ * @return Sum of all values in the warp (valid only for lane 0)
+ */
+template <typename T>
+__device__ __forceinline__ T warpReduceSum(T val) {
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
 }
 
 /**
- * @brief Computes the trace of a matrix.
+ * @brief Block-level reduction using shared memory and warp shuffle
+ * @tparam T Data type
+ * @param val Value to reduce
+ * @param shared Shared memory buffer (size >= blockDim.x / WARP_SIZE)
+ * @return Sum of all values in the block (valid only for thread 0)
+ */
+template <typename T>
+__device__ __forceinline__ T blockReduceSum(T val, T* shared) {
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int wid = threadIdx.x / WARP_SIZE;
+    
+    // Intra-warp reduction
+    val = warpReduceSum(val);
+    
+    // Write warp results to shared memory
+    if (lane == 0) {
+        shared[wid] = val;
+    }
+    __syncthreads();
+    
+    // Final reduction by first warp
+    const int numWarps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
+    val = (threadIdx.x < numWarps) ? shared[threadIdx.x] : T(0);
+    
+    if (wid == 0) {
+        val = warpReduceSum(val);
+    }
+    
+    return val;
+}
+
+// ============================================================================
+// TRACE KERNEL IMPLEMENTATION
+// ============================================================================
+
+/**
+ * @brief CUDA kernel for computing matrix trace with optimized reduction
+ * 
+ * Uses a two-phase approach:
+ * 1. Each thread loads one diagonal element
+ * 2. Block-level reduction using warp shuffle primitives
+ * 3. Atomic accumulation of block results
+ * 
+ * @tparam T Element type (int or float)
+ * @param input Flattened input matrix (row-major)
+ * @param output Pointer to scalar output (must be zero-initialized)
+ * @param rows Number of rows in the matrix
+ * @param cols Number of columns in the matrix
+ */
+template <typename T>
+__global__ void traceKernel(const T* __restrict__ input, 
+                            T* __restrict__ output, 
+                            size_t rows, 
+                            size_t cols) {
+    // Shared memory for block reduction
+    __shared__ T sharedMem[TRACE_BLOCK_SIZE / WARP_SIZE];
+    
+    const size_t diagLen = min(rows, cols);
+    const size_t globalIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Load diagonal element (coalesced access pattern for diagonal)
+    T localSum = T(0);
+    if (globalIdx < diagLen) {
+        // Diagonal element at position (i, i) in row-major layout
+        localSum = input[globalIdx * cols + globalIdx];
+    }
+    
+    // Block-level reduction
+    localSum = blockReduceSum(localSum, sharedMem);
+    
+    // Atomic accumulation (only thread 0 of each block)
+    if (threadIdx.x == 0) {
+        atomicAdd(output, localSum);
+    }
+}
+
+/**
+ * @brief Computes the trace of a matrix using CUDA
  *
  * The trace of a matrix is defined as the sum of its diagonal elements.
- * This function expects a flattened row-major matrix stored in a
- * std::vector. If the matrix is not square, the trace will sum up
- * elements along the main diagonal up to the smaller of rows or cols.
+ * This implementation uses parallel reduction on GPU for efficient computation.
  *
- * @tparam T The numeric type of matrix elements (e.g., float, int).
- * @param h_input A flattened matrix of size rows * cols.
- * @param rows Number of rows in the matrix.
- * @param cols Number of columns in the matrix.
- * @return The trace (sum of diagonal values) of the matrix.
+ * Algorithm complexity: O(n/p) where n = min(rows, cols) and p = #threads
+ * 
+ * @tparam T The numeric type of matrix elements (int or float)
+ * @param h_input A flattened row-major matrix of size rows * cols
+ * @param rows Number of rows in the matrix
+ * @param cols Number of columns in the matrix
+ * @return The trace (sum of diagonal values) of the matrix
  */
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
-  size_t diag_len = std::min(rows, cols);
-  if (diag_len == 0) return T(0);
-  
-  // Allocate device memory
-  T* d_input;
-  T* d_output;
-  size_t input_size = rows * cols * sizeof(T);
-  
-  cudaMalloc(&d_input, input_size);
-  cudaMalloc(&d_output, sizeof(T));
-  
-  // Copy input to device and initialize output to 0
-  cudaMemcpy(d_input, h_input.data(), input_size, cudaMemcpyHostToDevice);
-  cudaMemset(d_output, 0, sizeof(T));
-  
-  // Launch kernel
-  int blockSize = 256;
-  int numBlocks = (diag_len + blockSize - 1) / blockSize;
-  size_t sharedMemSize = blockSize * sizeof(T);
-  
-  traceKernel<T><<<numBlocks, blockSize, sharedMemSize>>>(d_input, d_output, rows, cols);
-  
-  // Copy result back
-  T result;
-  cudaMemcpy(&result, d_output, sizeof(T), cudaMemcpyDeviceToHost);
-  
-  // Cleanup
-  cudaFree(d_input);
-  cudaFree(d_output);
-  
-  return result;
+    // Handle edge cases
+    const size_t diagLen = std::min(rows, cols);
+    if (diagLen == 0) {
+        return T(0);
+    }
+    
+    // Calculate memory requirements
+    const size_t inputBytes = rows * cols * sizeof(T);
+    const size_t outputBytes = sizeof(T);
+    
+    // Allocate device memory
+    T* d_input = nullptr;
+    T* d_output = nullptr;
+    cudaMalloc(&d_input, inputBytes);
+    cudaMalloc(&d_output, outputBytes);
+    
+    // Transfer input data to device
+    cudaMemcpy(d_input, h_input.data(), inputBytes, cudaMemcpyHostToDevice);
+    cudaMemset(d_output, 0, outputBytes);
+    
+    // Configure kernel launch parameters
+    const int blockSize = TRACE_BLOCK_SIZE;
+    const int numBlocks = (diagLen + blockSize - 1) / blockSize;
+    
+    // Launch trace kernel
+    traceKernel<T><<<numBlocks, blockSize>>>(d_input, d_output, rows, cols);
+    
+    // Retrieve result
+    T result;
+    cudaMemcpy(&result, d_output, outputBytes, cudaMemcpyDeviceToHost);
+    
+    // Release device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+    
+    return result;
 }
 
-// ===================== FLASH ATTENTION KERNEL =====================
-// Helper: convert float to type T
+// ============================================================================
+// FLASH ATTENTION IMPLEMENTATION
+// ============================================================================
+
+/**
+ * @brief Type conversion utilities for mixed-precision computation
+ */
 template <typename T>
-__device__ __forceinline__ T floatToT(float val);
+struct TypeConverter {
+    __device__ __forceinline__ static float toFloat(T val);
+    __device__ __forceinline__ static T fromFloat(float val);
+};
 
 template <>
-__device__ __forceinline__ float floatToT<float>(float val) { return val; }
+struct TypeConverter<float> {
+    __device__ __forceinline__ static float toFloat(float val) { return val; }
+    __device__ __forceinline__ static float fromFloat(float val) { return val; }
+};
 
 template <>
-__device__ __forceinline__ half floatToT<half>(float val) { return __float2half(val); }
+struct TypeConverter<half> {
+    __device__ __forceinline__ static float toFloat(half val) { return __half2float(val); }
+    __device__ __forceinline__ static half fromFloat(float val) { return __float2half(val); }
+};
 
-// Helper: convert type T to float
-template <typename T>
-__device__ __forceinline__ float TtoFloat(T val);
-
-template <>
-__device__ __forceinline__ float TtoFloat<float>(float val) { return val; }
-
-template <>
-__device__ __forceinline__ float TtoFloat<half>(half val) { return __half2float(val); }
-
+/**
+ * @brief Optimized Flash Attention kernel with online softmax
+ * 
+ * Implementation features:
+ * - Online softmax computation for numerical stability
+ * - Shared memory tiling for K and V
+ * - GQA support via head index remapping
+ * - Causal masking with early termination
+ * 
+ * @tparam T Data type (float or half)
+ */
 template <typename T>
 __global__ void flashAttentionKernel(
     const T* __restrict__ Q,
     const T* __restrict__ K,
     const T* __restrict__ V,
     T* __restrict__ O,
-    int batch_size, int tgt_seq_len, int src_seq_len,
-    int query_heads, int kv_heads, int head_dim,
-    bool is_causal, float scale) {
-  
-  // Each thread handles one output element
-  // Grid: (batch_size * tgt_seq_len * query_heads, head_dim)
-  int linear_idx = blockIdx.x;
-  int d = blockIdx.y * blockDim.x + threadIdx.x;
-  
-  if (d >= head_dim) return;
-  
-  int b = linear_idx / (tgt_seq_len * query_heads);
-  int remainder = linear_idx % (tgt_seq_len * query_heads);
-  int t = remainder / query_heads;
-  int h = remainder % query_heads;
-  
-  if (b >= batch_size) return;
-  
-  // GQA: map query head to kv head
-  int kv_h = h / (query_heads / kv_heads);
-  
-  // Compute attention for this position
-  // Q shape: [batch_size, tgt_seq_len, query_heads, head_dim]
-  // K shape: [batch_size, src_seq_len, kv_heads, head_dim]
-  // V shape: [batch_size, src_seq_len, kv_heads, head_dim]
-  
-  float max_val = -1e9f;
-  float sum_exp = 0.0f;
-  float output_acc = 0.0f;
-  
-  // First pass: find max for numerical stability
-  for (int s = 0; s < src_seq_len; s++) {
-    // Causal mask: only attend to positions <= t
-    if (is_causal && s > t) continue;
+    const int batchSize,
+    const int tgtSeqLen,
+    const int srcSeqLen,
+    const int queryHeads,
+    const int kvHeads,
+    const int headDim,
+    const bool isCausal,
+    const float scale) {
     
-    // Compute Q[b,t,h,:] dot K[b,s,kv_h,:]
-    float dot = 0.0f;
-    for (int dd = 0; dd < head_dim; dd++) {
-      int q_idx = ((b * tgt_seq_len + t) * query_heads + h) * head_dim + dd;
-      int k_idx = ((b * src_seq_len + s) * kv_heads + kv_h) * head_dim + dd;
-      dot += TtoFloat(Q[q_idx]) * TtoFloat(K[k_idx]);
+    // Shared memory for tiled K and V
+    extern __shared__ char sharedMemory[];
+    float* sharedK = reinterpret_cast<float*>(sharedMemory);
+    float* sharedV = sharedK + TILE_SIZE * headDim;
+    
+    // Thread and block identification
+    const int batchIdx = blockIdx.z;
+    const int headIdx = blockIdx.y;
+    const int tgtPos = blockIdx.x;
+    const int tid = threadIdx.x;
+    
+    // Early exit for out-of-bounds
+    if (batchIdx >= batchSize || headIdx >= queryHeads || tgtPos >= tgtSeqLen) {
+        return;
     }
-    dot *= scale;
-    max_val = fmaxf(max_val, dot);
-  }
-  
-  // Second pass: compute softmax and weighted sum
-  for (int s = 0; s < src_seq_len; s++) {
-    if (is_causal && s > t) continue;
     
-    // Recompute dot product
-    float dot = 0.0f;
-    for (int dd = 0; dd < head_dim; dd++) {
-      int q_idx = ((b * tgt_seq_len + t) * query_heads + h) * head_dim + dd;
-      int k_idx = ((b * src_seq_len + s) * kv_heads + kv_h) * head_dim + dd;
-      dot += TtoFloat(Q[q_idx]) * TtoFloat(K[k_idx]);
+    // GQA: map query head to corresponding KV head
+    const int kvHeadIdx = headIdx / (queryHeads / kvHeads);
+    
+    // Base pointers
+    const int qOffset = ((batchIdx * tgtSeqLen + tgtPos) * queryHeads + headIdx) * headDim;
+    const int kvBatchOffset = batchIdx * srcSeqLen * kvHeads * headDim;
+    
+    // Load query vector into registers
+    float qReg[8] = {0.0f};
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        const int d = tid + i * blockDim.x;
+        if (d < headDim) {
+            qReg[i] = TypeConverter<T>::toFloat(Q[qOffset + d]);
+        }
     }
-    dot *= scale;
     
-    float exp_val = expf(dot - max_val);
-    sum_exp += exp_val;
+    // Online softmax state
+    float maxScore = -INFINITY;
+    float sumExp = 0.0f;
+    float output[8] = {0.0f};
     
-    // Accumulate weighted V
-    int v_idx = ((b * src_seq_len + s) * kv_heads + kv_h) * head_dim + d;
-    output_acc += exp_val * TtoFloat(V[v_idx]);
-  }
-  
-  // Normalize and write output
-  int o_idx = ((b * tgt_seq_len + t) * query_heads + h) * head_dim + d;
-  if (sum_exp > 0.0f) {
-    O[o_idx] = floatToT<T>(output_acc / sum_exp);
-  } else {
-    O[o_idx] = floatToT<T>(0.0f);
-  }
+    // Determine max source position (causal optimization)
+    const int maxSrcPos = isCausal ? min(tgtPos + 1, srcSeqLen) : srcSeqLen;
+    
+    // Process K/V in tiles
+    for (int tileStart = 0; tileStart < maxSrcPos; tileStart += TILE_SIZE) {
+        const int tileEnd = min(tileStart + TILE_SIZE, maxSrcPos);
+        const int tileLen = tileEnd - tileStart;
+        
+        // Collaborative loading of K and V tiles
+        for (int loadIdx = tid; loadIdx < tileLen * headDim; loadIdx += blockDim.x) {
+            const int localSrcPos = loadIdx / headDim;
+            const int d = loadIdx % headDim;
+            const int globalSrcPos = tileStart + localSrcPos;
+            
+            const int kvIdx = kvBatchOffset + (globalSrcPos * kvHeads + kvHeadIdx) * headDim + d;
+            sharedK[localSrcPos * headDim + d] = TypeConverter<T>::toFloat(K[kvIdx]);
+            sharedV[localSrcPos * headDim + d] = TypeConverter<T>::toFloat(V[kvIdx]);
+        }
+        __syncthreads();
+        
+        // Compute attention for each position in tile
+        for (int localSrcPos = 0; localSrcPos < tileLen; localSrcPos++) {
+            // Compute Q·K^T
+            float score = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const int d = tid + i * blockDim.x;
+                if (d < headDim) {
+                    score += qReg[i] * sharedK[localSrcPos * headDim + d];
+                }
+            }
+            
+            // Warp reduction for score
+            #pragma unroll
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                score += __shfl_down_sync(0xffffffff, score, offset);
+            }
+            score = __shfl_sync(0xffffffff, score, 0);
+            score *= scale;
+            
+            // Online softmax update
+            const float prevMax = maxScore;
+            maxScore = fmaxf(maxScore, score);
+            const float expCorrection = expf(prevMax - maxScore);
+            sumExp = sumExp * expCorrection + expf(score - maxScore);
+            
+            // Update output with correction
+            const float attnWeight = expf(score - maxScore);
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const int d = tid + i * blockDim.x;
+                if (d < headDim) {
+                    output[i] = output[i] * expCorrection + attnWeight * sharedV[localSrcPos * headDim + d];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    
+    // Normalize and write output
+    const float invSum = (sumExp > 0.0f) ? (1.0f / sumExp) : 0.0f;
+    const int oOffset = ((batchIdx * tgtSeqLen + tgtPos) * queryHeads + headIdx) * headDim;
+    
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        const int d = tid + i * blockDim.x;
+        if (d < headDim) {
+            O[oOffset + d] = TypeConverter<T>::fromFloat(output[i] * invSum);
+        }
+    }
 }
 
 /**
- * @brief Computes flash attention for given query, key, and value tensors.
+ * @brief Fallback attention kernel for arbitrary dimensions
  * 
- * @tparam T Data type (float) for input/output tensors
- * @param[in] h_q Query tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
- * @param[in] h_k Key tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
- * @param[in] h_v Value tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
- * @param[out] h_o Output attention tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
- * @param[in] batch_size Batch dimension size
- * @param[in] target_seq_len Target sequence length
- * @param[in] src_seq_len Source sequence length  
- * @param[in] query_heads Number of query attention heads
- * @param[in] kv_heads Number of key/value heads (supports grouped query attention)
- * @param[in] head_dim Dimension size of each attention head
- * @param[in] is_causal Whether to apply causal masking
+ * Standard two-pass softmax implementation for correctness.
+ */
+template <typename T>
+__global__ void flashAttentionSimpleKernel(
+    const T* __restrict__ Q,
+    const T* __restrict__ K,
+    const T* __restrict__ V,
+    T* __restrict__ O,
+    const int batchSize,
+    const int tgtSeqLen,
+    const int srcSeqLen,
+    const int queryHeads,
+    const int kvHeads,
+    const int headDim,
+    const bool isCausal,
+    const float scale) {
+    
+    const int linearIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int totalOutputs = batchSize * tgtSeqLen * queryHeads * headDim;
+    
+    if (linearIdx >= totalOutputs) return;
+    
+    // Decode linear index
+    const int d = linearIdx % headDim;
+    const int h = (linearIdx / headDim) % queryHeads;
+    const int t = (linearIdx / (headDim * queryHeads)) % tgtSeqLen;
+    const int b = linearIdx / (headDim * queryHeads * tgtSeqLen);
+    
+    // GQA mapping
+    const int kvH = h / (queryHeads / kvHeads);
+    
+    // Determine source range
+    const int maxSrcPos = isCausal ? min(t + 1, srcSeqLen) : srcSeqLen;
+    
+    // First pass: find max
+    float maxVal = -INFINITY;
+    for (int s = 0; s < maxSrcPos; s++) {
+        float dot = 0.0f;
+        for (int dd = 0; dd < headDim; dd++) {
+            const int qIdx = ((b * tgtSeqLen + t) * queryHeads + h) * headDim + dd;
+            const int kIdx = ((b * srcSeqLen + s) * kvHeads + kvH) * headDim + dd;
+            dot += TypeConverter<T>::toFloat(Q[qIdx]) * TypeConverter<T>::toFloat(K[kIdx]);
+        }
+        maxVal = fmaxf(maxVal, dot * scale);
+    }
+    
+    // Second pass: softmax + weighted sum
+    float sumExp = 0.0f;
+    float result = 0.0f;
+    
+    for (int s = 0; s < maxSrcPos; s++) {
+        float dot = 0.0f;
+        for (int dd = 0; dd < headDim; dd++) {
+            const int qIdx = ((b * tgtSeqLen + t) * queryHeads + h) * headDim + dd;
+            const int kIdx = ((b * srcSeqLen + s) * kvHeads + kvH) * headDim + dd;
+            dot += TypeConverter<T>::toFloat(Q[qIdx]) * TypeConverter<T>::toFloat(K[kIdx]);
+        }
+        
+        const float expVal = expf(dot * scale - maxVal);
+        sumExp += expVal;
+        
+        const int vIdx = ((b * srcSeqLen + s) * kvHeads + kvH) * headDim + d;
+        result += expVal * TypeConverter<T>::toFloat(V[vIdx]);
+    }
+    
+    const int oIdx = ((b * tgtSeqLen + t) * queryHeads + h) * headDim + d;
+    O[oIdx] = TypeConverter<T>::fromFloat((sumExp > 0.0f) ? (result / sumExp) : 0.0f);
+}
+
+/**
+ * @brief Computes Flash Attention for given query, key, and value tensors
+ * 
+ * Implements scaled dot-product attention with support for:
+ * - Causal masking (for autoregressive models)
+ * - Grouped Query Attention (GQA) where query_heads > kv_heads
+ * 
+ * The attention computation follows:
+ *   Attention(Q, K, V) = softmax(Q @ K^T / sqrt(head_dim)) @ V
+ * 
+ * @tparam T Data type (float or half)
+ * @param h_q Query tensor [batch_size, tgt_seq_len, query_heads, head_dim]
+ * @param h_k Key tensor [batch_size, src_seq_len, kv_heads, head_dim]
+ * @param h_v Value tensor [batch_size, src_seq_len, kv_heads, head_dim]
+ * @param h_o Output tensor [batch_size, tgt_seq_len, query_heads, head_dim]
+ * @param batch_size Batch dimension size
+ * @param target_seq_len Target sequence length
+ * @param src_seq_len Source sequence length
+ * @param query_heads Number of query attention heads
+ * @param kv_heads Number of key/value heads (for GQA)
+ * @param head_dim Dimension size of each attention head
+ * @param is_causal Whether to apply causal masking
  */
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
                     int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
-  // Calculate sizes
-  size_t q_size = batch_size * target_seq_len * query_heads * head_dim;
-  size_t kv_size = batch_size * src_seq_len * kv_heads * head_dim;
-  size_t o_size = q_size;
-  
-  // Ensure output vector is properly sized
-  h_o.resize(o_size);
-  
-  // Allocate device memory
-  T *d_q, *d_k, *d_v, *d_o;
-  cudaMalloc(&d_q, q_size * sizeof(T));
-  cudaMalloc(&d_k, kv_size * sizeof(T));
-  cudaMalloc(&d_v, kv_size * sizeof(T));
-  cudaMalloc(&d_o, o_size * sizeof(T));
-  
-  // Copy inputs to device
-  cudaMemcpy(d_q, h_q.data(), q_size * sizeof(T), cudaMemcpyHostToDevice);
-  cudaMemcpy(d_k, h_k.data(), kv_size * sizeof(T), cudaMemcpyHostToDevice);
-  cudaMemcpy(d_v, h_v.data(), kv_size * sizeof(T), cudaMemcpyHostToDevice);
-  
-  // Scale factor: 1/sqrt(head_dim)
-  float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-  
-  // Launch kernel
-  // Grid: one block per (batch, target_pos, head) combination
-  int num_outputs = batch_size * target_seq_len * query_heads;
-  dim3 grid(num_outputs, (head_dim + 31) / 32);
-  dim3 block(32);  // 32 threads per block for head_dim dimension
-  
-  flashAttentionKernel<T><<<grid, block>>>(
-      d_q, d_k, d_v, d_o,
-      batch_size, target_seq_len, src_seq_len,
-      query_heads, kv_heads, head_dim,
-      is_causal, scale);
-  
-  // Copy result back
-  cudaMemcpy(h_o.data(), d_o, o_size * sizeof(T), cudaMemcpyDeviceToHost);
-  
-  // Cleanup
-  cudaFree(d_q);
-  cudaFree(d_k);
-  cudaFree(d_v);
-  cudaFree(d_o);
+                    int query_heads, int kv_heads, int head_dim, bool is_causal) {
+    // Calculate tensor sizes
+    const size_t qSize = batch_size * target_seq_len * query_heads * head_dim;
+    const size_t kvSize = batch_size * src_seq_len * kv_heads * head_dim;
+    const size_t oSize = qSize;
+    
+    // Ensure output vector is properly sized
+    h_o.resize(oSize);
+    
+    // Allocate device memory
+    T *d_q, *d_k, *d_v, *d_o;
+    cudaMalloc(&d_q, qSize * sizeof(T));
+    cudaMalloc(&d_k, kvSize * sizeof(T));
+    cudaMalloc(&d_v, kvSize * sizeof(T));
+    cudaMalloc(&d_o, oSize * sizeof(T));
+    
+    // Transfer input data to device
+    cudaMemcpy(d_q, h_q.data(), qSize * sizeof(T), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, h_k.data(), kvSize * sizeof(T), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, h_v.data(), kvSize * sizeof(T), cudaMemcpyHostToDevice);
+    
+    // Compute scaling factor: 1 / sqrt(head_dim)
+    const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    
+    // Choose kernel based on problem size
+    const bool useOptimizedKernel = (head_dim <= 256) && (head_dim % 32 == 0);
+    
+    if (useOptimizedKernel) {
+        // Optimized tiled kernel
+        const int blockSize = min(256, (head_dim + 7) / 8 * 8);
+        const size_t sharedMemSize = 2 * TILE_SIZE * head_dim * sizeof(float);
+        
+        dim3 grid(target_seq_len, query_heads, batch_size);
+        dim3 block(blockSize);
+        
+        flashAttentionKernel<T><<<grid, block, sharedMemSize>>>(
+            d_q, d_k, d_v, d_o,
+            batch_size, target_seq_len, src_seq_len,
+            query_heads, kv_heads, head_dim,
+            is_causal, scale);
+    } else {
+        // Fallback kernel for arbitrary dimensions
+        const int totalOutputs = batch_size * target_seq_len * query_heads * head_dim;
+        const int blockSize = 256;
+        const int numBlocks = (totalOutputs + blockSize - 1) / blockSize;
+        
+        flashAttentionSimpleKernel<T><<<numBlocks, blockSize>>>(
+            d_q, d_k, d_v, d_o,
+            batch_size, target_seq_len, src_seq_len,
+            query_heads, kv_heads, head_dim,
+            is_causal, scale);
+    }
+    
+    // Transfer results back to host
+    cudaMemcpy(h_o.data(), d_o, oSize * sizeof(T), cudaMemcpyDeviceToHost);
+    
+    // Release device memory
+    cudaFree(d_q);
+    cudaFree(d_k);
+    cudaFree(d_v);
+    cudaFree(d_o);
 }
 
-// *********************************************************************
-// Explicit Template Instantiations (REQUIRED FOR LINKING WITH TESTER.O)
-// DO NOT MODIFY THIS SECTION
-// *********************************************************************
+// ============================================================================
+// EXPLICIT TEMPLATE INSTANTIATIONS
+// Required for linking with the tester - DO NOT MODIFY
+// ============================================================================
 template int trace<int>(const std::vector<int>&, size_t, size_t);
 template float trace<float>(const std::vector<float>&, size_t, size_t);
 template void flashAttention<float>(const std::vector<float>&, const std::vector<float>&,
