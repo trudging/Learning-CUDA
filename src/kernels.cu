@@ -154,7 +154,7 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
     
     // Use fewer blocks with grid-stride loop for better efficiency
     const int blockSize = TRACE_BLOCK_SIZE;
-    const int numBlocks = min((int)((diagLen + blockSize - 1) / blockSize), 128);
+    const int numBlocks = std::min((int)((diagLen + blockSize - 1) / blockSize), 128);
     
     traceKernelOptimized<T><<<numBlocks, blockSize>>>(d_input, d_output, rows, cols);
     
