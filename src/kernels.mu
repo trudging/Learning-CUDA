@@ -191,11 +191,12 @@ __global__ void flashAttentionKernel(
         
         float prevMax = maxVal;
         maxVal = fmaxf(maxVal, dot);
-        float correction = expf(prevMax - maxVal);
-        sumExp = sumExp * correction + expf(dot - maxVal);
+        float correction = (prevMax == -INFINITY) ? 0.0f : expf(prevMax - maxVal);
+        float weight = expf(dot - maxVal);
+        sumExp = sumExp * correction + weight;
         
         int vIdx = ((b * srcSeqLen + s) * kvHeads + kvH) * headDim + d;
-        result = result * correction + expf(dot - maxVal) * TypeConverter<T>::toFloat(V[vIdx]);
+        result = result * correction + weight * TypeConverter<T>::toFloat(V[vIdx]);
     }
     
     int oIdx = ((b * tgtSeqLen + t) * queryHeads + h) * headDim + d;
