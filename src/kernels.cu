@@ -351,13 +351,13 @@ __global__ void flashAttentionFallback(
     const int kvH = h / (queryHeads / kvHeads);
     const int maxSrc = isCausal ? min(t + 1, srcSeqLen) : srcSeqLen;
     
-    // Online softmax approach - use double precision for accumulation
-    double maxVal = -INFINITY;
-    double sumExp = 0.0;
-    double result = 0.0;
+    // Online softmax approach
+    float maxVal = -INFINITY;
+    float sumExp = 0.0f;
+    float result = 0.0f;
     
     for (int s = 0; s < maxSrc; s++) {
-        double dot = 0.0;
+        float dot = 0.0f;
         for (int dd = 0; dd < headDim; dd++) {
             int qIdx = ((b * tgtSeqLen + t) * queryHeads + h) * headDim + dd;
             int kIdx = ((b * srcSeqLen + s) * kvHeads + kvH) * headDim + dd;
@@ -365,10 +365,10 @@ __global__ void flashAttentionFallback(
         }
         dot *= scale;
         
-        double prevMax = maxVal;
-        maxVal = fmax(maxVal, dot);
-        double correction = (prevMax == -INFINITY) ? 0.0 : exp(prevMax - maxVal);
-        double weight = exp(dot - maxVal);
+        float prevMax = maxVal;
+        maxVal = fmaxf(maxVal, dot);
+        float correction = (prevMax == -INFINITY) ? 0.0f : expf(prevMax - maxVal);
+        float weight = expf(dot - maxVal);
         sumExp = sumExp * correction + weight;
         
         int vIdx = ((b * srcSeqLen + s) * kvHeads + kvH) * headDim + d;
@@ -376,7 +376,7 @@ __global__ void flashAttentionFallback(
     }
     
     int oIdx = ((b * tgtSeqLen + t) * queryHeads + h) * headDim + d;
-    O[oIdx] = TypeConverter<T>::fromFloat((sumExp > 0.0) ? (result / sumExp) : 0.0);
+    O[oIdx] = TypeConverter<T>::fromFloat((sumExp > 0.0f) ? (result / sumExp) : 0.0f);
 }
 
 /**
