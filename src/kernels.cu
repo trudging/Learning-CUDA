@@ -289,14 +289,14 @@ __global__ void flashAttentionKernelOpt(
             dot = __shfl_sync(0xffffffff, dot, 0);
             dot *= scale;
             
-            // Online softmax
+            // Online softmax with improved numerical stability
             float prevMax = rowMax;
             rowMax = fmaxf(rowMax, dot);
-            float correction = expf(prevMax - rowMax);
-            rowSum = rowSum * correction + expf(dot - rowMax);
+            float correction = (prevMax == -INFINITY) ? 0.0f : expf(prevMax - rowMax);
+            float weight = expf(dot - rowMax);
+            rowSum = rowSum * correction + weight;
             
             // Update output
-            float weight = expf(dot - rowMax);
             #pragma unroll
             for (int i = 0; i < 8; i++) {
                 int d = tid + i * blockDim.x;
@@ -351,13 +351,13 @@ __global__ void flashAttentionFallback(
     const int kvH = h / (queryHeads / kvHeads);
     const int maxSrc = isCausal ? min(t + 1, srcSeqLen) : srcSeqLen;
     
-    // Online softmax approach
-    float maxVal = -INFINITY;
-    float sumExp = 0.0f;
-    float result = 0.0f;
+    // Online softmax approach - use double precision for accumulation
+    double maxVal = -INFINITY;
+    double sumExp = 0.0;
+    double result = 0.0;
     
     for (int s = 0; s < maxSrc; s++) {
-        float dot = 0.0f;
+        double dot = 0.0;
         for (int dd = 0; dd < headDim; dd++) {
             int qIdx = ((b * tgtSeqLen + t) * queryHeads + h) * headDim + dd;
             int kIdx = ((b * srcSeqLen + s) * kvHeads + kvH) * headDim + dd;
@@ -365,17 +365,18 @@ __global__ void flashAttentionFallback(
         }
         dot *= scale;
         
-        float prevMax = maxVal;
-        maxVal = fmaxf(maxVal, dot);
-        float correction = expf(prevMax - maxVal);
-        sumExp = sumExp * correction + expf(dot - maxVal);
+        double prevMax = maxVal;
+        maxVal = fmax(maxVal, dot);
+        double correction = (prevMax == -INFINITY) ? 0.0 : exp(prevMax - maxVal);
+        double weight = exp(dot - maxVal);
+        sumExp = sumExp * correction + weight;
         
         int vIdx = ((b * srcSeqLen + s) * kvHeads + kvH) * headDim + d;
-        result = result * correction + expf(dot - maxVal) * TypeConverter<T>::toFloat(V[vIdx]);
+        result = result * correction + weight * TypeConverter<T>::toFloat(V[vIdx]);
     }
     
     int oIdx = ((b * tgtSeqLen + t) * queryHeads + h) * headDim + d;
-    O[oIdx] = TypeConverter<T>::fromFloat((sumExp > 0.0f) ? (result / sumExp) : 0.0f);
+    O[oIdx] = TypeConverter<T>::fromFloat((sumExp > 0.0) ? (result / sumExp) : 0.0);
 }
 
 /**
