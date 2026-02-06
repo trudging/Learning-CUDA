@@ -419,7 +419,6 @@ __global__ void flashAttentionFallback(
     O[oIdx] = TypeConverter<T>::fromFloat((sumExp > 0.0f) ? (result / sumExp) : 0.0f);
 #endif
 }
-}
 
 /**
  * @brief Computes Flash Attention for given query, key, and value tensors
