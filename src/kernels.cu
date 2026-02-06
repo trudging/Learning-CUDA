@@ -246,19 +246,9 @@ __global__ void flashAttentionKernelOpt(
     }
     
     // Online softmax state
-#ifdef PLATFORM_ILUVATAR
-    using AccT = double;
-    #define EXP_FUNC exp
-    #define MAX_FUNC fmax
-#else
-    using AccT = float;
-    #define EXP_FUNC expf
-    #define MAX_FUNC fmaxf
-#endif
-
-    AccT rowMax = -INFINITY;
-    AccT rowSum = 0.0;
-    AccT outReg[8] = {0.0};
+    float rowMax = -INFINITY;
+    float rowSum = 0.0f;
+    float outReg[8] = {0.0f};
     
     // Effective length with causal masking
     const int maxSrc = isCausal ? min(tgtPos + 1, srcSeqLen) : srcSeqLen;
@@ -281,12 +271,12 @@ __global__ void flashAttentionKernelOpt(
         // Process each K position
         for (int s = 0; s < tileLen; s++) {
             // Compute dot product
-            AccT dot = 0.0;
+            float dot = 0.0f;
             #pragma unroll
             for (int i = 0; i < 8; i++) {
                 int d = tid + i * blockDim.x;
                 if (d < headDim) {
-                    dot += (AccT)qReg[i] * sK[s * headDim + d];
+                    dot += qReg[i] * sK[s * headDim + d];
                 }
             }
             
@@ -300,10 +290,10 @@ __global__ void flashAttentionKernelOpt(
             dot *= scale;
             
             // Online softmax with improved numerical stability
-            AccT prevMax = rowMax;
-            rowMax = MAX_FUNC(rowMax, dot);
-            AccT correction = (prevMax == -INFINITY) ? 0.0 : EXP_FUNC(prevMax - rowMax);
-            AccT weight = EXP_FUNC(dot - rowMax);
+            float prevMax = rowMax;
+            rowMax = fmaxf(rowMax, dot);
+            float correction = (prevMax == -INFINITY) ? 0.0f : expf(prevMax - rowMax);
+            float weight = expf(dot - rowMax);
             rowSum = rowSum * correction + weight;
             
             // Update output
@@ -311,7 +301,7 @@ __global__ void flashAttentionKernelOpt(
             for (int i = 0; i < 8; i++) {
                 int d = tid + i * blockDim.x;
                 if (d < headDim) {
-                    outReg[i] = outReg[i] * correction + weight * (AccT)sV[s * headDim + d];
+                    outReg[i] = outReg[i] * correction + weight * sV[s * headDim + d];
                 }
             }
         }
@@ -319,14 +309,14 @@ __global__ void flashAttentionKernelOpt(
     }
     
     // Write output
-    AccT invSum = (rowSum > 0.0) ? ((AccT)1.0 / rowSum) : (AccT)0.0;
+    float invSum = (rowSum > 0.0f) ? (1.0f / rowSum) : 0.0f;
     size_t oBase = ((size_t)batchIdx * tgtSeqLen + tgtPos) * queryHeads * headDim + headIdx * headDim;
     
     #pragma unroll
     for (int i = 0; i < 8; i++) {
         int d = tid + i * blockDim.x;
         if (d < headDim) {
-            O[oBase + d] = TypeConverter<T>::fromFloat((float)(outReg[i] * invSum));
+            O[oBase + d] = TypeConverter<T>::fromFloat(outReg[i] * invSum);
         }
     }
 }
@@ -362,35 +352,6 @@ __global__ void flashAttentionFallback(
     const int maxSrc = isCausal ? min(t + 1, srcSeqLen) : srcSeqLen;
     
     // Online softmax approach
-#if defined(PLATFORM_ILUVATAR)
-    // Use double precision on Iluvatar to fix float stability issues
-    // Only applied when PLATFORM_ILUVATAR is defined, safe for NVIDIA/MetaX
-    double maxVal = -INFINITY;
-    double sumExp = 0.0;
-    double result = 0.0;
-    
-    for (int s = 0; s < maxSrc; s++) {
-        double dot = 0.0;
-        for (int dd = 0; dd < headDim; dd++) {
-            int qIdx = ((b * tgtSeqLen + t) * queryHeads + h) * headDim + dd;
-            int kIdx = ((b * srcSeqLen + s) * kvHeads + kvH) * headDim + dd;
-            dot += TypeConverter<T>::toFloat(Q[qIdx]) * TypeConverter<T>::toFloat(K[kIdx]);
-        }
-        dot *= scale;
-        
-        double prevMax = maxVal;
-        maxVal = fmax(maxVal, dot);
-        double correction = (prevMax == -INFINITY) ? 0.0 : exp(prevMax - maxVal);
-        double weight = exp(dot - maxVal);
-        sumExp = sumExp * correction + weight;
-        
-        int vIdx = ((b * srcSeqLen + s) * kvHeads + kvH) * headDim + d;
-        result = result * correction + weight * TypeConverter<T>::toFloat(V[vIdx]);
-    }
-    
-    int oIdx = ((b * tgtSeqLen + t) * queryHeads + h) * headDim + d;
-    O[oIdx] = TypeConverter<T>::fromFloat((sumExp > 0.0) ? (result / sumExp) : 0.0);
-#else
     // Standard float implementation for NVIDIA and others (verified 90/90 passed)
     float maxVal = -INFINITY;
     float sumExp = 0.0f;
@@ -417,7 +378,6 @@ __global__ void flashAttentionFallback(
     
     int oIdx = ((b * tgtSeqLen + t) * queryHeads + h) * headDim + d;
     O[oIdx] = TypeConverter<T>::fromFloat((sumExp > 0.0f) ? (result / sumExp) : 0.0f);
-#endif
 }
 
 /**
